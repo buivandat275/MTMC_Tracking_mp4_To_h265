@@ -21,7 +21,7 @@ def to_long_path(path: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Flatten MTMC video folders, trim videos longer than 10 minutes, and rename them sequentially."
+        description="Flatten MTMC video folders, trim videos longer than 10 minutes, encode to H.265, and rename them sequentially."
     )
     parser.add_argument(
         "input_dir",
@@ -49,12 +49,24 @@ def parse_args() -> argparse.Namespace:
         "--crf",
         type=int,
         default=23,
-        help="x265 CRF value for trimmed/converted output. Lower means higher quality. Default: 23",
+        help="Quality value for output video. Used as CRF for libx265 or CQ for hevc_nvenc. Lower means higher quality. Default: 23",
     )
     parser.add_argument(
         "--preset",
-        default="medium",
-        help="x265 preset. Default: medium",
+        default=None,
+        help="Encoder preset. Default: p5 for T4 NVENC, p6 for L4 NVENC, medium for libx265",
+    )
+    parser.add_argument(
+        "--video-codec",
+        default="hevc_nvenc",
+        choices=["hevc_nvenc", "libx265"],
+        help="Video encoder to use. Default: hevc_nvenc",
+    )
+    parser.add_argument(
+        "--gpu-target",
+        default="auto",
+        choices=["auto", "t4", "l4"],
+        help="Tune NVENC defaults for the target GPU. Default: auto",
     )
     return parser.parse_args()
 
@@ -111,13 +123,78 @@ def output_name(index: int, date_text: str, time_text: str) -> str:
     return f"cam_{index:02d}_{date_text}_{time_text}.mp4"
 
 
+def default_nvenc_preset(gpu_target: str) -> str:
+    if gpu_target == "l4":
+        return "p6"
+    return "p5"
+
+
+def default_nvenc_lookahead(gpu_target: str) -> int:
+    if gpu_target == "l4":
+        return 32
+    return 20
+
+
+def build_video_codec_args(
+    video_codec: str,
+    quality: int,
+    preset: str | None,
+    gpu_target: str,
+) -> list[str]:
+    if video_codec == "hevc_nvenc":
+        encoder_preset = preset or default_nvenc_preset(gpu_target)
+        lookahead = default_nvenc_lookahead(gpu_target)
+        return [
+            "-c:v",
+            "hevc_nvenc",
+            "-preset",
+            encoder_preset,
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            str(quality),
+            "-b:v",
+            "0",
+            "-profile:v",
+            "main",
+            "-pix_fmt",
+            "yuv420p",
+            "-bf",
+            "3",
+            "-b_ref_mode",
+            "middle",
+            "-spatial_aq",
+            "1",
+            "-aq-strength",
+            "8",
+            "-temporal_aq",
+            "1",
+            "-rc-lookahead",
+            str(lookahead),
+        ]
+
+    encoder_preset = preset or "medium"
+    return [
+        "-c:v",
+        "libx265",
+        "-preset",
+        encoder_preset,
+        "-crf",
+        str(quality),
+    ]
+
+
 def run_ffmpeg(
     ffmpeg_path: str,
     source: Path,
     destination: Path,
     duration_limit: float | None,
     crf: int,
-    preset: str,
+    preset: str | None,
+    video_codec: str,
+    gpu_target: str,
 ) -> bool:
     command = [
         ffmpeg_path,
@@ -135,12 +212,16 @@ def run_ffmpeg(
         "0:v:0",
         "-map",
         "0:a?",
-        "-c:v",
-        "libx265",
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
+    ]
+
+    command += build_video_codec_args(
+        video_codec=video_codec,
+        quality=crf,
+        preset=preset,
+        gpu_target=gpu_target,
+    )
+
+    command += [
         "-tag:v",
         "hvc1",
         "-c:a",
@@ -183,6 +264,9 @@ def main() -> int:
 
     print(f"Found {len(videos)} video file(s).")
     print(f"Output folder: {output_dir}")
+    print(f"Video codec: {args.video_codec}")
+    if args.video_codec == "hevc_nvenc":
+        print(f"GPU target: {args.gpu_target}")
 
     for index, source in enumerate(videos, start=1):
         destination = output_dir / output_name(index, date_text, time_text)
@@ -209,6 +293,8 @@ def main() -> int:
             duration_limit=trim_seconds if duration > MAX_SECONDS else None,
             crf=args.crf,
             preset=args.preset,
+            video_codec=args.video_codec,
+            gpu_target=args.gpu_target,
         )
 
         if not ok:
